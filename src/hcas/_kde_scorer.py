@@ -11,6 +11,7 @@ import logging
 import numpy as np
 import xarray as xr
 from scipy.stats import gaussian_kde
+from sklearn.isotonic import IsotonicRegression
 
 from ._defaults import KDE_BW_FACTOR, MIN_NEIGHBOURHOOD_SIZE, N_ESTIMATORS, RF_MIN_SAMPLES_LEAF, RF_N_JOBS
 from ._proximity import compute_proximity_sparse, get_neighbourhood, train_rf
@@ -148,6 +149,7 @@ class RFProximityScorer:
         self.random_state = random_state
         self.min_neighbourhood_size = min_neighbourhood_size
         self.kde_bw_factor = kde_bw_factor
+        self.calibration_ = None
 
     def fit(self, ds, predictor_vars, outcome_vars):
         """Train RF on reference pixels (where ref_mask == 1).
@@ -184,6 +186,45 @@ class RFProximityScorer:
         )
         return self
 
+    def calibrate(self, raw_scores, true_conditions):
+        """Fit a monotone recalibration from labelled sites.
+
+        Fits an isotonic regression that maps raw condition scores to
+        labelled true-condition values.  The mapping is monotonically
+        non-decreasing, so the ordering of scores on the original scale
+        is never reversed.
+
+        After calling this method, subsequent calls to :meth:`score` will
+        automatically apply the calibration.  To remove calibration, call
+        ``scorer.calibration_ = None``.
+
+        Parameters
+        ----------
+        raw_scores : array-like of shape (n_sites,)
+            Uncalibrated condition scores (output of :meth:`score` for the
+            labelled sites).  NaN values are silently dropped.
+        true_conditions : array-like of shape (n_sites,)
+            Known true condition values in [0, 1] for the same sites.
+
+        Returns
+        -------
+        self
+        """
+        raw_scores = np.asarray(raw_scores, dtype=np.float64).ravel()
+        true_conditions = np.asarray(true_conditions, dtype=np.float64).ravel()
+
+        valid = ~(np.isnan(raw_scores) | np.isnan(true_conditions))
+        raw_scores = raw_scores[valid]
+        true_conditions = true_conditions[valid]
+
+        ir = IsotonicRegression(y_min=0, y_max=1, increasing=True,
+                                out_of_bounds="clip")
+        ir.fit(raw_scores, true_conditions)
+        self.calibration_ = ir
+
+        logger.info("Calibration fitted on %d labelled sites.", len(raw_scores))
+        return self
+
     def score(self, ds, predictor_vars, outcome_vars):
         """Score test pixels (where test_mask != 0).
 
@@ -200,6 +241,7 @@ class RFProximityScorer:
         -------
         result : xr.DataArray
             Condition scores with dims (lat, lon). NaN at non-test pixels.
+            If :meth:`calibrate` has been called, scores are recalibrated.
         """
         X_test, Y_test, lats, lons, test_mask_2d = _extract_pixels(
             ds, predictor_vars, outcome_vars, "test_mask",
@@ -221,6 +263,9 @@ class RFProximityScorer:
             conditions[i] = _score_single_site(
                 Y_test[i], Y_neighbourhood, weights, self.kde_bw_factor,
             )
+
+        if self.calibration_ is not None:
+            conditions = self.calibration_.predict(conditions)
 
         # Reconstruct 2D DataArray
         result = np.full(test_mask_2d.shape, np.nan)

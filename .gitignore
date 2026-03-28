@@ -19,5 +19,13 @@ build/
 # Sandbox (local experiments, reports, outputs)
 sandbox/
 
+# extra files
+files/
+notebook/*.json
+
+
 # Large files
 *.pdf
+
+#macs
+*.DS_Store
